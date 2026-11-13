@@ -1,14 +1,17 @@
 diff --git a/matron/src/hardware/screen/sdl.c b/matron/src/hardware/screen/sdl.c
-index 4f9343db..9d606514 100644
 --- a/matron/src/hardware/screen/sdl.c
 +++ b/matron/src/hardware/screen/sdl.c
-@@ -1,4 +1,5 @@
+@@ -1,13 +1,17 @@
  #include <fcntl.h>
 +#include <pthread.h>
  #include <math.h>
  #include <stdio.h>
++#include <stdint.h>
  #include <stdlib.h>
-@@ -8,6 +9,7 @@
++#include <string.h>
+ 
+ #include <SDL2/SDL.h>
+ #include <cairo.h>
  
  #include "hardware/io.h"
  #include "hardware/screen/screens.h"
@@ -16,7 +19,7 @@ index 4f9343db..9d606514 100644
  
  typedef struct _screen_sdl_priv {
      SDL_Window *window;
-@@ -66,11 +68,137 @@ static void screen_sdl_destroy(matron_io_t *io) {
+@@ -66,11 +70,363 @@
      cairo_surface_destroy(fb->surface);
  }
  
@@ -41,6 +44,222 @@ index 4f9343db..9d606514 100644
 +    pthread_mutex_unlock(&frame_lock);
 +}
 +
++// --- NORNS_SCREEN_STYLE=red-lcd ----------------------------------------
++// A 1970s red backlit display: lit pixels glow through red plastic, with a
++// visible pixel grid, bloom, uneven light from bulbs behind the panel, a
++// faint sheen on the plastic and a slow crystal.
++
++#define LCD_W 128
++#define LCD_H 64
++#define LCD_LUT 1024
++#define LCD_LUT_MAX 3.0f
++
++static float lcd_src[LCD_H][LCD_W];   // the frame matron drew, 0..1
++static float lcd_disp[LCD_H][LCD_W];  // what the crystal shows (it lags)
++static float lcd_glow[LCD_H][LCD_W];  // bloom right around lit pixels
++static float lcd_halo[LCD_H][LCD_W];  // light diffused through the plastic
++static float lcd_tmp[LCD_H][LCD_W];
++static uint32_t lcd_lut[LCD_LUT];     // intensity -> red-filtered colour
++static SDL_Surface *lcd_out = NULL;   // rendered at the window's size
++static float *lcd_back = NULL;        // backlight per output pixel
++static float *lcd_spec = NULL;        // plastic sheen and grain
++static int lcd_animating = 0;
++
++static int screen_style_lcd(void) {
++    static int lcd = -1;
++    if (lcd < 0) {
++        const char *style = getenv("NORNS_SCREEN_STYLE");
++        lcd = style != NULL && strcmp(style, "red-lcd") == 0;
++    }
++    return lcd;
++}
++
++// The largest 2:1 rectangle centred in w x h.
++static SDL_Rect screen_fit(int w, int h) {
++    SDL_Rect r;
++    r.w = w;
++    r.h = w / 2;
++    if (r.h > h) {
++        r.h = h;
++        r.w = h * 2;
++    }
++    r.x = (w - r.w) / 2;
++    r.y = (h - r.h) / 2;
++    return r;
++}
++
++static float lcd_smoothstep(float a, float b, float x) {
++    float t = (x - a) / (b - a);
++    t = t < 0 ? 0 : t > 1 ? 1 : t;
++    return t * t * (3 - 2 * t);
++}
++
++static void lcd_blur(float src[LCD_H][LCD_W], float dst[LCD_H][LCD_W], float sigma) {
++    int r = (int)ceilf(sigma * 3);
++    float k[64];
++    float sum = 0;
++    for (int i = -r; i <= r; i++) {
++        k[i + r] = expf(-(float)(i * i) / (2 * sigma * sigma));
++        sum += k[i + r];
++    }
++    for (int i = 0; i <= 2 * r; i++) {
++        k[i] /= sum;
++    }
++    for (int y = 0; y < LCD_H; y++) {
++        for (int x = 0; x < LCD_W; x++) {
++            float a = 0;
++            for (int i = -r; i <= r; i++) {
++                int xx = x + i;
++                if (xx >= 0 && xx < LCD_W) {
++                    a += src[y][xx] * k[i + r];
++                }
++            }
++            lcd_tmp[y][x] = a;
++        }
++    }
++    for (int y = 0; y < LCD_H; y++) {
++        for (int x = 0; x < LCD_W; x++) {
++            float a = 0;
++            for (int i = -r; i <= r; i++) {
++                int yy = y + i;
++                if (yy >= 0 && yy < LCD_H) {
++                    a += lcd_tmp[yy][x] * k[i + r];
++                }
++            }
++            dst[y][x] = a;
++        }
++    }
++}
++
++static float lcd_sample(float m[LCD_H][LCD_W], float u, float v) {
++    u -= 0.5f;
++    v -= 0.5f;
++    int x0 = (int)floorf(u), y0 = (int)floorf(v);
++    float fx = u - x0, fy = v - y0;
++    int x1 = x0 + 1, y1 = y0 + 1;
++    x0 = x0 < 0 ? 0 : x0 >= LCD_W ? LCD_W - 1 : x0;
++    x1 = x1 < 0 ? 0 : x1 >= LCD_W ? LCD_W - 1 : x1;
++    y0 = y0 < 0 ? 0 : y0 >= LCD_H ? LCD_H - 1 : y0;
++    y1 = y1 < 0 ? 0 : y1 >= LCD_H ? LCD_H - 1 : y1;
++    float a = m[y0][x0] + (m[y0][x1] - m[y0][x0]) * fx;
++    float b = m[y1][x0] + (m[y1][x1] - m[y1][x0]) * fx;
++    return a + (b - a) * fy;
++}
++
++// Called with frame_lock held: copy matron's frame (16 grey levels in
++// RGB565; green has the most bits).
++static void lcd_take_frame(SDL_Surface *draw) {
++    for (int y = 0; y < LCD_H; y++) {
++        const uint16_t *row = (const uint16_t *)((const uint8_t *)draw->pixels + y * draw->pitch);
++        for (int x = 0; x < LCD_W; x++) {
++            lcd_src[y][x] = (float)((row[x] >> 5) & 0x3f) / 63.0f;
++        }
++    }
++}
++
++static void lcd_setup(int w, int h) {
++    if (lcd_out != NULL && lcd_out->w == w && lcd_out->h == h) {
++        return;
++    }
++    if (lcd_out == NULL) {
++        // Red light through red plastic: red saturates first, and only the
++        // hottest spots run towards orange.
++        for (int i = 0; i < LCD_LUT; i++) {
++            float e = LCD_LUT_MAX * i / (LCD_LUT - 1);
++            float r = 1 - expf(-2.4f * e);
++            float g = 1 - expf(-0.13f * e * e);
++            float b = 1 - expf(-0.035f * e * e * e);
++            lcd_lut[i] = 0xff000000u | (uint32_t)(r * 255) << 16 | (uint32_t)(g * 255) << 8 | (uint32_t)(b * 255);
++        }
++    }
++    SDL_FreeSurface(lcd_out);
++    free(lcd_back);
++    free(lcd_spec);
++    lcd_out = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
++    lcd_back = malloc(sizeof(float) * w * h);
++    lcd_spec = malloc(sizeof(float) * w * h);
++    if (lcd_out == NULL || lcd_back == NULL || lcd_spec == NULL) {
++        return;
++    }
++    SDL_Rect r = screen_fit(w, h);
++    for (int y = 0; y < h; y++) {
++        for (int x = 0; x < w; x++) {
++            float nx = (2.0f * (x - r.x) + 1) / r.w - 1;
++            float ny = (2.0f * (y - r.y) + 1) / r.h - 1;
++            // two bulbs behind the panel, falling off towards the edges
++            float dl = nx + 0.5f, dr = nx - 0.5f, dy = ny - 0.1f;
++            float back = 0.72f - 0.22f * (nx * nx * 0.7f + ny * ny);
++            back += 0.38f * expf(-(dl * dl) / 0.16f - (dy * dy) / 0.6f);
++            back += 0.38f * expf(-(dr * dr) / 0.16f - (dy * dy) / 0.6f);
++            lcd_back[y * w + x] = back;
++            // a soft diagonal reflection on the plastic, plus grain
++            float d = nx * 0.35f - ny * 0.5f + 0.28f;
++            uint32_t n = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u;
++            n = (n ^ (n >> 13)) * 1274126177u;
++            float grain = ((n >> 16) & 0xff) / 255.0f - 0.5f;
++            lcd_spec[y * w + x] = 0.05f * expf(-d * d / 0.02f) + 0.018f * grain;
++        }
++    }
++}
++
++static void lcd_render(SDL_Surface *window) {
++    lcd_setup(window->w, window->h);
++    if (lcd_out == NULL || lcd_back == NULL || lcd_spec == NULL) {
++        SDL_FillRect(window, NULL, 0);
++        return;
++    }
++    // The crystal follows the frame quickly on, slowly off.
++    lcd_animating = 0;
++    for (int y = 0; y < LCD_H; y++) {
++        for (int x = 0; x < LCD_W; x++) {
++            float t = lcd_src[y][x], d = lcd_disp[y][x];
++            d += (t - d) * (t > d ? 0.6f : 0.28f);
++            if (fabsf(t - d) < 0.004f) {
++                d = t;
++            } else {
++                lcd_animating = 1;
++            }
++            lcd_disp[y][x] = d;
++        }
++    }
++    lcd_blur(lcd_disp, lcd_glow, 0.9f);
++    lcd_blur(lcd_disp, lcd_halo, 5.0f);
++
++    SDL_Rect r = screen_fit(window->w, window->h);
++    float scale = (float)r.w / LCD_W;
++    float gap = 0.09f, soft = 0.5f / scale;
++    if (soft < 0.03f) {
++        soft = 0.03f;
++    }
++    for (int y = 0; y < lcd_out->h; y++) {
++        uint32_t *row = (uint32_t *)((uint8_t *)lcd_out->pixels + y * lcd_out->pitch);
++        float v = (y - r.y + 0.5f) / scale;
++        int iy = (int)floorf(v);
++        float fy = v - iy;
++        float my = lcd_smoothstep(gap - soft, gap + soft, fy) * lcd_smoothstep(gap - soft, gap + soft, 1 - fy);
++        for (int x = 0; x < lcd_out->w; x++) {
++            float u = (x - r.x + 0.5f) / scale;
++            int ix = (int)floorf(u);
++            if (ix < 0 || ix >= LCD_W || iy < 0 || iy >= LCD_H) {
++                row[x] = 0xff070303u;  // bezel
++                continue;
++            }
++            float fx = u - ix;
++            float mask = my * lcd_smoothstep(gap - soft, gap + soft, fx) * lcd_smoothstep(gap - soft, gap + soft, 1 - fx);
++            float back = lcd_back[y * window->w + x];
++            float lit = lcd_disp[iy][ix];
++            // Off cells leak a little light; the gaps between them less.
++            float e = back * (0.075f * (0.5f + 0.5f * mask) + 1.15f * lit * mask);
++            e += back * (0.55f * lcd_sample(lcd_glow, u, v) + 0.22f * lcd_sample(lcd_halo, u, v));
++            e += lcd_spec[y * window->w + x];
++            int i = (int)(e * (LCD_LUT - 1) / LCD_LUT_MAX);
++            i = i < 0 ? 0 : i >= LCD_LUT ? LCD_LUT - 1 : i;
++            row[x] = lcd_lut[i];
++        }
++    }
++    SDL_BlitSurface(lcd_out, NULL, window, NULL);
++}
++
 +static int screen_sdl_open_window(screen_sdl_priv_t *priv) {
 +    if (priv->window != NULL) {
 +        return 0;
@@ -58,7 +277,7 @@ index 4f9343db..9d606514 100644
 +    }
 +    priv->window = SDL_CreateWindow("matron",
 +                                    SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, windowSize.w, windowSize.h,
-+                                    SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI);
++                                    SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
 +    if (priv->window == NULL) {
 +        fprintf(stderr, "screen:sdl: SDL_CreateWindow failed: %s\n", SDL_GetError());
 +        window_failed = 1;
@@ -137,27 +356,37 @@ index 4f9343db..9d606514 100644
 +        }
 +    }
 +
++    int lcd = screen_style_lcd();
 +    int present = 0;
 +    pthread_mutex_lock(&frame_lock);
-+    if (frame_dirty || repaint) {
++    if (frame_dirty || repaint || lcd_animating) {
 +        // SDL invalidates the window surface whenever the window is
 +        // reconfigured (on Wayland, right after it's created), so fetch it
 +        // every time.
 +        priv->window_surface = SDL_GetWindowSurface(priv->window);
 +        if (priv->window_surface != NULL) {
-+            SDL_BlitScaled(priv->draw_surface, NULL, priv->window_surface, &windowSize);
++            if (lcd) {
++                lcd_take_frame(priv->draw_surface);
++            } else {
++                SDL_Rect r = screen_fit(priv->window_surface->w, priv->window_surface->h);
++                SDL_FillRect(priv->window_surface, NULL, 0);
++                SDL_BlitScaled(priv->draw_surface, NULL, priv->window_surface, &r);
++            }
 +            frame_dirty = 0;
 +            present = 1;
 +        }
 +    }
 +    pthread_mutex_unlock(&frame_lock);
 +    if (present) {
++        if (lcd) {
++            lcd_render(priv->window_surface);
++        }
 +        SDL_UpdateWindowSurface(priv->window);
 +    }
  }
  
  static void screen_sdl_bind(matron_fb_t *fb, cairo_surface_t *surface) {
-@@ -85,18 +213,17 @@ static void screen_sdl_surface_destroy(void *data) {
+@@ -85,18 +441,17 @@
          return;
      }
      SDL_FreeSurface(priv->draw_surface);
@@ -182,7 +411,6 @@ index 4f9343db..9d606514 100644
                                                128, 64,
                                                16, 0xf800, 0x000007e0, 0x0000001f,
 diff --git a/matron/src/screen_events.c b/matron/src/screen_events.c
-index 032a517e..b8b97f1f 100644
 --- a/matron/src/screen_events.c
 +++ b/matron/src/screen_events.c
 @@ -1,5 +1,9 @@
@@ -195,7 +423,7 @@ index 032a517e..b8b97f1f 100644
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
-@@ -80,19 +84,61 @@ void screen_event_data_pop(struct screen_event_data *dst) {
+@@ -80,19 +84,61 @@
      screen_q_rd = (screen_q_rd + 1) & SCREEN_Q_MASK;
  }
  

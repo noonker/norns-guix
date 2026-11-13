@@ -37,6 +37,7 @@ Options (`home-norns-configuration`):
 | `maiden-port` | `5000` | |
 | `repl-address` | `"127.0.0.1"` | where maiden and the matron/sclang REPLs (5555/5556) listen; `"*"` for every interface |
 | `pipewire` | `pipewire` | whose `pw-jack` runs the audio processes; `#f` for plain JACK |
+| `screen-style` | `'red-lcd` | `'red-lcd`, a 1970s red backlit display, or `'plain` pixels |
 | `log-directory` | `~/.local/var/log` | `norns-crone.log`, `norns-sclang.log`, `norns-matron.log` |
 | `auto-start?` | `#f` | start at login |
 
@@ -50,6 +51,11 @@ The matron window takes these keys when focused:
 | W / E | E1 left / right |
 | S / D | E2 left / right |
 | X / C | E3 left / right |
+
+The window can be resized (it keeps the screen's 2:1 shape). By default it
+looks like a 1970s red backlit display: a dot grid glowing through red
+plastic, with bloom, uneven backlight and a slightly slow crystal. Set
+`screen-style` to `'plain` for the bare pixels.
 
 Closing the window does nothing; stop norns with `herd stop norns`.
 
@@ -90,6 +96,8 @@ Guix and x86:
   - the window surface is fetched every time (SDL invalidates it when the
     window is reconfigured, which on Wayland happens right away)
   - the keys above, and no SDL signal handlers (they swallowed SIGTERM)
+  - the window is resizable, and `NORNS_SCREEN_STYLE=red-lcd` renders the
+    red LCD look
   - `NORNS_SDL_DEBUG=1` logs the window's events
 - the SELECT menu's hardcoded `/home/we/dust/code/`
 

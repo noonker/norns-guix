@@ -72,6 +72,10 @@
   ;; on every interface, as a norns does.
   (repl-address   home-norns-configuration-repl-address
                   (default "127.0.0.1"))
+  ;; How the screen window looks: 'red-lcd (a 1970s red backlit display)
+  ;; or 'plain (the bare pixels, scaled).
+  (screen-style   home-norns-configuration-screen-style
+                  (default 'red-lcd))
   ;; Directory for the services' logs; #f means ~/.local/var/log.
   (log-directory  home-norns-configuration-log-directory
                   (default #f))
@@ -250,7 +254,8 @@ leaving it~%" link)
 
 (define (norns-shepherd-services config)
   (match-record config <home-norns-configuration>
-    (norns supercollider pipewire repl-address maiden maiden-port auto-start?)
+    (norns supercollider pipewire repl-address maiden maiden-port
+     screen-style auto-start?)
     (define nhome (norns-home-gexp config))
     (define (repl-url port)
       (string-append "ws://" repl-address ":" (number->string port)))
@@ -391,7 +396,8 @@ leaving it~%" link)
              '(norns-setup norns-crone norns-sclang)
              #~(list #$ws-wrapper #$(repl-url 5555)
                      #$(file-append norns "/bin/matron"))
-             wayland-display)
+             wayland-display
+             (string-append "NORNS_SCREEN_STYLE=" (symbol->string screen-style)))
      maiden-service
      (shepherd-service
       (provision '(norns))

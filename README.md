@@ -78,11 +78,16 @@ Guix and x86:
   `<string>`, the `lua53` pkg-config name
 - metro threads get a 256 KiB stack: the 16 KiB `PTHREAD_STACK_MIN` fails
   (`EINVAL`) once static TLS outgrows it, and those metros never run
-- `patches/norns-desktop-sdl-input.patch`: matron's event loop pumps SDL
-  events (nothing did, so the window never handled any), the window surface
-  is fetched on every paint (SDL invalidates it when the window is
-  reconfigured, so on Wayland nothing was ever shown), the keys above, and
-  no SDL signal handlers (they swallowed SIGTERM)
+- `patches/norns-desktop-sdl-input.patch`, for the SDL window:
+  - all SDL calls happen on one thread, the screen event thread. matron
+    paints from two (the boot animation has its own), which on Wayland
+    gave black frames and crashed at startup; now painting only draws
+    offscreen and the screen thread opens the window, pumps its events
+    and shows new frames every 20 ms
+  - the window surface is fetched every time (SDL invalidates it when the
+    window is reconfigured, which on Wayland happens right away)
+  - the keys above, and no SDL signal handlers (they swallowed SIGTERM)
+  - `NORNS_SDL_DEBUG=1` logs the window's events
 - the SELECT menu's hardcoded `/home/we/dust/code/`
 
 ## Not here yet

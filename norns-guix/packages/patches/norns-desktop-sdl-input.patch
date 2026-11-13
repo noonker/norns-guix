@@ -1,0 +1,148 @@
+diff --git a/matron/src/events.c b/matron/src/events.c
+index d08689bc..19903983 100644
+--- a/matron/src/events.c
++++ b/matron/src/events.c
+@@ -7,6 +7,10 @@
+ #include <string.h>
+ 
+ #include <pthread.h>
++#ifdef NORNS_DESKTOP
++#include <errno.h>
++#include <time.h>
++#endif
+ 
+ #include "battery.h"
+ #include "device_monome.h"
+@@ -176,8 +180,27 @@ MATRON_API void event_post(union event_data *ev) {
+ }
+ 
+ // main loop to read events!
++#ifdef NORNS_DESKTOP
++// The SDL window lives on this thread, so its events are pumped here: at
++// least every SDL_PUMP_NS while idle, and between events while busy.
++#define SDL_PUMP_NS 20000000L
++extern void screen_sdl_pump(void);
++
++static void timespec_add_ns(struct timespec *t, long ns) {
++    t->tv_nsec += ns;
++    while (t->tv_nsec >= 1000000000L) {
++        t->tv_nsec -= 1000000000L;
++        t->tv_sec++;
++    }
++}
++#endif
++
+ void event_loop(void) {
+     union event_data *ev;
++#ifdef NORNS_DESKTOP
++    struct timespec next_pump;
++    clock_gettime(CLOCK_REALTIME, &next_pump);
++#endif
+     while (!quit) {
+         pthread_mutex_lock(&evq.lock);
+         // while() because contention may produce spurious wakeup
+@@ -187,7 +210,17 @@ void event_loop(void) {
+             //// need to set an explicit sigint handler
+             // atomically unlocks the mutex, sleeps on condvar, locks again on
+             // wakeup
++#ifdef NORNS_DESKTOP
++            if (pthread_cond_timedwait(&evq.nonempty, &evq.lock, &next_pump) == ETIMEDOUT) {
++                pthread_mutex_unlock(&evq.lock);
++                screen_sdl_pump();
++                clock_gettime(CLOCK_REALTIME, &next_pump);
++                timespec_add_ns(&next_pump, SDL_PUMP_NS);
++                pthread_mutex_lock(&evq.lock);
++            }
++#else
+             pthread_cond_wait(&evq.nonempty, &evq.lock);
++#endif
+         }
+         // fprintf(stderr, "evq.size : %d\n", (int) evq.size);
+         assert(evq.size > 0);
+@@ -196,6 +229,16 @@ void event_loop(void) {
+         if (ev != NULL) {
+             handle_event(ev);
+         }
++#ifdef NORNS_DESKTOP
++        struct timespec now;
++        clock_gettime(CLOCK_REALTIME, &now);
++        if (now.tv_sec > next_pump.tv_sec ||
++            (now.tv_sec == next_pump.tv_sec && now.tv_nsec >= next_pump.tv_nsec)) {
++            screen_sdl_pump();
++            next_pump = now;
++            timespec_add_ns(&next_pump, SDL_PUMP_NS);
++        }
++#endif
+     }
+ }
+ 
+diff --git a/matron/src/hardware/screen/sdl.c b/matron/src/hardware/screen/sdl.c
+index 4f9343db..2fa4ddb8 100644
+--- a/matron/src/hardware/screen/sdl.c
++++ b/matron/src/hardware/screen/sdl.c
+@@ -8,6 +8,7 @@
+ 
+ #include "hardware/io.h"
+ #include "hardware/screen/screens.h"
++#include "events.h"
+ 
+ typedef struct _screen_sdl_priv {
+     SDL_Window *window;
+@@ -89,6 +90,49 @@ static void screen_sdl_surface_destroy(void *data) {
+     free(priv);
+ }
+ 
++static int window_open = 0;
++
++// Called from the event loop thread, which owns the window: keeps the window
++// responsive and turns keys into norns keys and encoders.
++//   Q A Z    keys 1-3
++//   W/E      encoder 1 left/right (S/D encoder 2, X/C encoder 3)
++void screen_sdl_pump(void) {
++    if (!window_open) {
++        return;
++    }
++    SDL_Event event;
++    while (SDL_PollEvent(&event)) {
++        if (event.type != SDL_KEYDOWN && event.type != SDL_KEYUP) {
++            continue;
++        }
++        int down = event.type == SDL_KEYDOWN;
++        int key = 0, enc = 0, delta = 0;
++        switch (event.key.keysym.scancode) {
++        case SDL_SCANCODE_Q: key = 1; break;
++        case SDL_SCANCODE_A: key = 2; break;
++        case SDL_SCANCODE_Z: key = 3; break;
++        case SDL_SCANCODE_W: enc = 1; delta = -1; break;
++        case SDL_SCANCODE_E: enc = 1; delta = 1; break;
++        case SDL_SCANCODE_S: enc = 2; delta = -1; break;
++        case SDL_SCANCODE_D: enc = 2; delta = 1; break;
++        case SDL_SCANCODE_X: enc = 3; delta = -1; break;
++        case SDL_SCANCODE_C: enc = 3; delta = 1; break;
++        default: break;
++        }
++        if (key && !event.key.repeat) {
++            union event_data *ev = event_data_new(EVENT_KEY);
++            ev->key.n = key;
++            ev->key.val = down;
++            event_post(ev);
++        } else if (enc && down) {
++            union event_data *ev = event_data_new(EVENT_ENC);
++            ev->enc.n = enc;
++            ev->enc.delta = delta;
++            event_post(ev);
++        }
++    }
++}
++
+ static cairo_surface_t *screen_sdl_surface_create(screen_sdl_priv_t *priv) {
+     cairo_surface_t *surface;
+ 
+@@ -97,6 +141,7 @@ static cairo_surface_t *screen_sdl_surface_create(screen_sdl_priv_t *priv) {
+                                     SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, windowSize.w, windowSize.h,
+                                     SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI);
+     priv->window_surface = SDL_GetWindowSurface(priv->window);
++    window_open = 1;
+     priv->draw_surface = SDL_CreateRGBSurface(0,
+                                               128, 64,
+                                               16, 0xf800, 0x000007e0, 0x0000001f,

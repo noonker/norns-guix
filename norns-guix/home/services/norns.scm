@@ -100,7 +100,7 @@ exec \"$@\"
          (script "systemctl" "#!/bin/sh
 # SYSTEM > RESTART runs \"systemctl restart\" on norns-sclang, norns-crone and
 # norns-matron, one at a time from inside matron, so restarting matron kills
-# the rest of the sequence.  The first call restarts all of them, detached.
+# the rest of the sequence.  The first call restarts all of norns, detached.
 case \"$1\" in
     restart|try-restart|reload-or-restart) ;;
     *) echo \"systemctl (norns): ignoring $*\" >&2; exit 0 ;;
@@ -108,12 +108,7 @@ esac
 lock=\"${XDG_RUNTIME_DIR:-/tmp}/norns-restart\"
 find \"$lock\" -maxdepth 0 -mmin +1 -exec rmdir {} \\; 2>/dev/null
 mkdir \"$lock\" 2>/dev/null || exit 0
-setsid -f sh -c '
-    herd stop norns-matron
-    herd restart norns-crone
-    herd restart norns-sclang
-    herd start norns
-    rmdir \"$0\"' \"$lock\" >/dev/null 2>&1
+setsid -f sh -c 'herd restart norns; rmdir \"$0\"' \"$lock\" >/dev/null 2>&1
 ")))))
 
 ;;; Gexp evaluating, inside shepherd, to norns' home directory.
@@ -293,6 +288,14 @@ leaving it~%" link)
                       ((@ (fibers) sleep) 0.1)
                       (loop (- tries 1))))))
             #f)))
+    ;; Stop matron, crone and sclang (and so whatever depends on them).
+    (define stop-daemons
+      #~(lambda ()
+          (for-each (lambda (name)
+                      (let ((service (lookup-service name)))
+                        (when (and service (service-running? service))
+                          (stop-service service))))
+                    '(norns-matron norns-crone norns-sclang))))
     (define ws-wrapper (file-append norns "/bin/ws-wrapper"))
     ;; matron opens its window on the session's Wayland display; shepherd
     ;; usually starts before the compositor, so find its socket.
@@ -336,7 +339,40 @@ leaving it~%" link)
       (documentation "norns: crone, SuperCollider and matron.")
       (auto-start? auto-start?)
       (start #~(const #t))
-      (stop #~(const #f))))))
+      ;; Starting norns starts its requirements, but stopping it only stops
+      ;; services that depend on it, so stop the daemons too: `herd stop
+      ;; norns' means all of them.  That can't happen inside this procedure
+      ;; (stopping them queries this service, which is busy until it
+      ;; returns), so a fiber does it once norns has stopped -- unless norns
+      ;; is being restarted (see the restart action).
+      (stop #~(lambda _
+                ((@ (fibers) spawn-fiber)
+                 (lambda ()
+                   (let ((self (lookup-service 'norns)))
+                     (let wait ()
+                       ((@ (fibers) sleep) 0.25)
+                       (unless (or (service-stopped? self)
+                                   (service-running? self))
+                         (wait)))
+                     (when (and (service-stopped? self)
+                                (not (object-property self 'norns-restarting)))
+                       (#$stop-daemons)))))
+                #f))
+      ;; `herd restart norns' restarts all of norns: stop the daemons (which
+      ;; stops norns, their dependent), then start norns (which starts them).
+      ;; Also what SYSTEM > RESTART does.
+      (actions
+       (list (shepherd-action
+              (name 'restart)
+              (documentation "Restart crone, SuperCollider and matron.")
+              (procedure
+               #~(lambda _
+                   (let ((self (lookup-service 'norns)))
+                     (set-object-property! self 'norns-restarting #t)
+                     (#$stop-daemons)
+                     (start-service self)
+                     (set-object-property! self 'norns-restarting #f)
+                     #t))))))))))
 
 (define home-norns-service-type
   (service-type

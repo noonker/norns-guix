@@ -5,7 +5,8 @@ norns (desktop build), libmonome, libgpiod 1.x and sc3-plugins, and a Guix
 Home service that runs norns as your own Shepherd services.
 
     herd start norns     # crone, SuperCollider and matron
-    herd stop norns
+    herd stop norns      # all of them
+    herd restart norns
 
 Audio goes through PipeWire's JACK, and the norns screen is a window on
 your desktop.
@@ -64,7 +65,7 @@ dust, and the SuperCollider extensions are linked into its Extensions.
 
 norns restarts itself with `sudo systemctl restart norns-...`; the services
 put small `sudo` and `systemctl` stand-ins on norns' `PATH` that turn that
-into `herd` commands.
+into `herd restart norns`.
 
 ## What's patched
 

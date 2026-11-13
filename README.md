@@ -43,7 +43,15 @@ Options (`home-norns-configuration`):
 
 ### The screen and keys
 
-The matron window takes these keys when focused:
+The matron window's keys work in one of two modes. **F12** switches
+between them, and the window title shows which one you're in.
+
+In *keyboard* mode, every key goes to norns as a USB keyboard would:
+scripts' `keyboard.code`/`keyboard.char`, the menus (F1-F4 pages, F5
+toggles the menu, arrows, Enter, Esc) and text entry.
+
+In *norns keys* mode (the default), these keys are the norns' keys and
+encoders:
 
 | keys | |
 |---|---|
@@ -95,11 +103,14 @@ Guix and x86:
     and shows new frames every 20 ms
   - the window surface is fetched every time (SDL invalidates it when the
     window is reconfigured, which on Wayland happens right away)
-  - the keys above, and no SDL signal handlers (they swallowed SIGTERM)
+  - the keys above, the F12 keyboard mode (keys posted as HID device 255,
+    which `hid.lua` hands to `keyboard.process`), and no SDL signal
+    handlers (they swallowed SIGTERM)
   - the window is resizable, and `NORNS_SCREEN_STYLE=red-lcd` renders the
     red LCD look
   - `NORNS_SDL_DEBUG=1` logs the window's events
-- the SELECT menu's hardcoded `/home/we/dust/code/`
+- the SELECT menu's hardcoded `/home/we/dust/code/`; it also follows symlinks
+  (so `dust/code` can link to your checkouts) and skips `tests/`
 
 ### maiden
 

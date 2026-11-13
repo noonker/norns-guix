@@ -178,7 +178,20 @@ typedef uint16_t guint16;
             (add-after 'unpack 'remove-hardcoded-home
               (lambda _
                 (substitute* "lua/core/menu/select.lua"
-                  (("'/home/we/dust/code/'") "_path.code"))))
+                  (("'/home/we/dust/code/'") "_path.code")
+                  ;; follow symlinked scripts (e.g. a link to a git checkout)
+                  (("find ~/dust/code/") "find -L ~/dust/code/")
+                  ;; and skip tests/ as well as test/
+                  (("\\|test\\|") "|tests?|"))
+                ;; The SDL window's keyboard mode sends keys as HID device
+                ;; 255 (256 here); there's no device entry for it.
+                (substitute* "lua/core/hid.lua"
+                  (("^_norns\\.hid\\.event = function\\(id, type, code, value\\)" all)
+                   (string-append all "
+  if id == 256 then
+    keyboard.process(type, code, value)
+    return
+  end")))))
             (add-after 'install 'install-runtime-tree
               ;; matron finds everything under $HOME/norns: Lua, fonts,
               ;; SuperCollider classes, docs and matronrc.lua.  The service

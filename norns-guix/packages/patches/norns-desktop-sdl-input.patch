@@ -77,7 +77,7 @@ index d08689bc..19903983 100644
  }
  
 diff --git a/matron/src/hardware/screen/sdl.c b/matron/src/hardware/screen/sdl.c
-index 4f9343db..2fa4ddb8 100644
+index 4f9343db..7b7e128f 100644
 --- a/matron/src/hardware/screen/sdl.c
 +++ b/matron/src/hardware/screen/sdl.c
 @@ -8,6 +8,7 @@
@@ -88,7 +88,27 @@ index 4f9343db..2fa4ddb8 100644
  
  typedef struct _screen_sdl_priv {
      SDL_Window *window;
-@@ -89,6 +90,49 @@ static void screen_sdl_surface_destroy(void *data) {
+@@ -66,9 +67,19 @@ static void screen_sdl_destroy(matron_io_t *io) {
+     cairo_surface_destroy(fb->surface);
+ }
+ 
++// The last frame painted, for repainting when the window is exposed.
++static matron_fb_t *last_fb = NULL;
++
+ static void screen_sdl_paint(matron_fb_t *fb) {
+     screen_sdl_priv_t *priv = fb->io.data;
++    last_fb = fb;
+     cairo_paint(fb->cairo);
++    // SDL invalidates the window surface whenever the window is reconfigured
++    // (on Wayland, right after it's created), so fetch it every time.
++    priv->window_surface = SDL_GetWindowSurface(priv->window);
++    if (priv->window_surface == NULL) {
++        return;
++    }
+     SDL_BlitScaled(priv->draw_surface, NULL, priv->window_surface, &windowSize);
+     SDL_UpdateWindowSurface(priv->window);
+ }
+@@ -89,14 +100,74 @@ static void screen_sdl_surface_destroy(void *data) {
      free(priv);
  }
  
@@ -104,6 +124,19 @@ index 4f9343db..2fa4ddb8 100644
 +    }
 +    SDL_Event event;
 +    while (SDL_PollEvent(&event)) {
++        if (event.type == SDL_WINDOWEVENT) {
++            switch (event.window.event) {
++            case SDL_WINDOWEVENT_SHOWN:
++            case SDL_WINDOWEVENT_EXPOSED:
++            case SDL_WINDOWEVENT_SIZE_CHANGED:
++                if (last_fb != NULL) {
++                    screen_sdl_paint(last_fb);
++                }
++                break;
++            default: break;
++            }
++            continue;
++        }
 +        if (event.type != SDL_KEYDOWN && event.type != SDL_KEYUP) {
 +            continue;
 +        }
@@ -138,7 +171,11 @@ index 4f9343db..2fa4ddb8 100644
  static cairo_surface_t *screen_sdl_surface_create(screen_sdl_priv_t *priv) {
      cairo_surface_t *surface;
  
-@@ -97,6 +141,7 @@ static cairo_surface_t *screen_sdl_surface_create(screen_sdl_priv_t *priv) {
++    // SDL turns SIGTERM/SIGINT into an SDL_QUIT event by default, which
++    // nothing reads; let them stop matron as usual instead.
++    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+     SDL_Init(SDL_INIT_VIDEO);
+     priv->window = SDL_CreateWindow("matron",
                                      SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, windowSize.w, windowSize.h,
                                      SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI);
      priv->window_surface = SDL_GetWindowSurface(priv->window);

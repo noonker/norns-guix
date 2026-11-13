@@ -157,6 +157,12 @@ hardware over serial.")
 #include <stdint.h>
 typedef uint16_t guint16;
 #define GINT16_TO_LE(x) htole16(x)"))
+                ;; Metro threads get a PTHREAD_STACK_MIN (16 KiB) stack, which
+                ;; glibc refuses (EINVAL) once static TLS outgrows it, as it
+                ;; does with these libraries: those metros never run.
+                (substitute* "matron/src/metro.c"
+                  (("pthread_attr_setstacksize\\(&attr, PTHREAD_STACK_MIN\\)")
+                   "pthread_attr_setstacksize(&attr, 256 * 1024)"))
                 ;; relied on <string> arriving transitively
                 (substitute* "crone/src/BufDiskWorker.h"
                   (("#include <atomic>")

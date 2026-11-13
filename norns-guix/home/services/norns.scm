@@ -8,6 +8,7 @@
   #:use-module (guix gexp)
   #:use-module (guix packages)
   #:use-module (guix records)
+  #:use-module (srfi srfi-1)
   #:use-module (norns-guix packages norns)
   #:use-module (norns-guix packages norns-extras)
   #:export (home-norns-configuration
@@ -60,10 +61,15 @@
   (supercollider-startup
    home-norns-configuration-supercollider-startup
    (default "Server.local.options.numOutputBusChannels = 4;\n"))
-  ;; Address the matron and sclang REPLs (ports 5555 and 5556, used by
-  ;; maiden) listen on.  Anyone who can reach them can run code as you, so
-  ;; the default is this machine only; "*" listens on every interface, as a
-  ;; norns does.
+  ;; maiden, the web editor (on maiden-port); #f for none.
+  (maiden         home-norns-configuration-maiden
+                  (default maiden))
+  (maiden-port    home-norns-configuration-maiden-port
+                  (default 5000))
+  ;; Address maiden and the matron and sclang REPLs (ports 5555 and 5556,
+  ;; which maiden's page connects to) listen on.  Anyone who can reach them
+  ;; can run code as you, so the default is this machine only; "*" listens
+  ;; on every interface, as a norns does.
   (repl-address   home-norns-configuration-repl-address
                   (default "127.0.0.1"))
   ;; Directory for the services' logs; #f means ~/.local/var/log.
@@ -134,7 +140,7 @@ setsid -f sh -c 'herd restart norns; rmdir \"$0\"' \"$lock\" >/dev/null 2>&1
 ;;; tracks package upgrades.
 (define (norns-setup-program config)
   (match-record config <home-norns-configuration>
-    (norns sc-extensions dust-directory supercollider-startup)
+    (norns sc-extensions dust-directory supercollider-startup maiden)
     (program-file
      "norns-setup"
      (with-imported-modules '((guix build utils))
@@ -182,6 +188,25 @@ leaving it~%" link)
                    #~(for-each (lambda (d) (mkdir-p (string-append dust d)))
                                '("/code" "/data" "/audio/tape"))))
 
+           ;; maiden: the script catalog's sources (what its
+           ;; project-setup.sh does), keeping any already there.
+           #$@(if maiden
+                  (list
+                   #~(let ((data (string-append nhome "/dust/data")))
+                       (mkdir-p (string-append data "/catalogs"))
+                       (for-each
+                        (lambda (src)
+                          (let ((dst (string-append data "/sources/"
+                                                    (basename src))))
+                            (unless (file-exists? dst)
+                              (mkdir-p (dirname dst))
+                              (copy-file src dst)
+                              (chmod dst #o644))))
+                        (find-files #$(file-append maiden
+                                                   "/share/maiden/dist/sources")
+                                    "\\.json$"))))
+                  '())
+
            ;; matron: the screen as an SDL window.
            (write-file! (string-append nhome "/matronrc.lua")
                         "_boot.add_io('screen:sdl', {})\n")
@@ -225,7 +250,7 @@ leaving it~%" link)
 
 (define (norns-shepherd-services config)
   (match-record config <home-norns-configuration>
-    (norns supercollider pipewire repl-address auto-start?)
+    (norns supercollider pipewire repl-address maiden maiden-port auto-start?)
     (define nhome (norns-home-gexp config))
     (define (repl-url port)
       (string-append "ws://" repl-address ":" (number->string port)))
@@ -295,8 +320,40 @@ leaving it~%" link)
                       (let ((service (lookup-service name)))
                         (when (and service (service-running? service))
                           (stop-service service))))
-                    '(norns-matron norns-crone norns-sclang))))
+                    '(norns-maiden norns-matron norns-crone norns-sclang))))
     (define ws-wrapper (file-append norns "/bin/ws-wrapper"))
+    ;; maiden, started by shepherd on the first connection to its port, as
+    ;; on a norns (socket activation; maiden serves on fd 3).
+    (define maiden-service
+      (and maiden
+           (let ((share (file-append maiden "/share/maiden"))
+                 (address (if (string=? repl-address "*")
+                              "0.0.0.0"
+                              repl-address)))
+             (shepherd-service
+              (provision '(norns-maiden))
+              (requirement '(norns-setup))
+              (documentation
+               (string-append "maiden, norns' web editor (http://localhost:"
+                              (number->string maiden-port) ")."))
+              (auto-start? #f)
+              (modules '((shepherd endpoints) (srfi srfi-1) (ice-9 ftw)))
+              (start #~(make-systemd-constructor
+                        (list #$(file-append maiden "/bin/maiden")
+                              "server" "--fd" "3"
+                              "--config" #$(file-append share "/maiden.yaml")
+                              "--app" #$(file-append share "/app/build")
+                              "--data" (string-append #$nhome "/dust")
+                              "--doc" (string-append #$nhome "/norns/doc"))
+                        (list (endpoint
+                               (make-socket-address
+                                AF_INET (inet-pton AF_INET #$address)
+                                #$maiden-port)
+                               #:name "http"))
+                        #:directory #$nhome
+                        #:environment-variables #$(environment)
+                        #:log-file #$(log-file-gexp config "norns-maiden")))
+              (stop #~(make-systemd-destructor))))))
     ;; matron opens its window on the session's Wayland display; shepherd
     ;; usually starts before the compositor, so find its socket.
     (define wayland-display
@@ -311,7 +368,9 @@ leaving it~%" link)
                                  '())))
                (if (null? sockets) "wayland-0" (car sockets))))))
 
-    (list
+    (filter
+     identity
+     (list
      (shepherd-service
       (provision '(norns-setup))
       (documentation "Prepare norns' home directory.")
@@ -333,9 +392,10 @@ leaving it~%" link)
              #~(list #$ws-wrapper #$(repl-url 5555)
                      #$(file-append norns "/bin/matron"))
              wayland-display)
+     maiden-service
      (shepherd-service
       (provision '(norns))
-      (requirement '(norns-matron))
+      (requirement (if maiden '(norns-matron norns-maiden) '(norns-matron)))
       (documentation "norns: crone, SuperCollider and matron.")
       (auto-start? auto-start?)
       (start #~(const #t))
@@ -372,7 +432,7 @@ leaving it~%" link)
                      (#$stop-daemons)
                      (start-service self)
                      (set-object-property! self 'norns-restarting #f)
-                     #t))))))))))
+                     #t)))))))))))
 
 (define home-norns-service-type
   (service-type

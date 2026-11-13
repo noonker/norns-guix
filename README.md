@@ -1,15 +1,15 @@
 # norns-guix
 
 [norns](https://monome.org/norns) on Guix, without Docker: packages for
-norns (desktop build), libmonome, libgpiod 1.x and sc3-plugins, and a Guix
-Home service that runs norns as your own Shepherd services.
+norns (desktop build), maiden, libmonome, libgpiod 1.x and sc3-plugins, and
+a Guix Home service that runs norns as your own Shepherd services.
 
     herd start norns     # crone, SuperCollider and matron
     herd stop norns      # all of them
     herd restart norns
 
-Audio goes through PipeWire's JACK, and the norns screen is a window on
-your desktop.
+Audio goes through PipeWire's JACK, the norns screen is a window on your
+desktop, and maiden (the web editor) is at http://localhost:5000.
 
 ## Using it
 
@@ -33,7 +33,9 @@ Options (`home-norns-configuration`):
 | `dust-directory` | `#f` | existing dust to link in; otherwise a fresh one |
 | `sc-extensions` | `(list sc3-plugins)` | SuperCollider extension packages |
 | `supercollider-startup` | four outputs | `startup.scd` (4deck's headphone cue uses outputs 3-4) |
-| `repl-address` | `"127.0.0.1"` | where the matron/sclang REPLs (5555/5556) listen; `"*"` for every interface |
+| `maiden` | `maiden` | the maiden package; `#f` for none |
+| `maiden-port` | `5000` | |
+| `repl-address` | `"127.0.0.1"` | where maiden and the matron/sclang REPLs (5555/5556) listen; `"*"` for every interface |
 | `pipewire` | `pipewire` | whose `pw-jack` runs the audio processes; `#f` for plain JACK |
 | `log-directory` | `~/.local/var/log` | `norns-crone.log`, `norns-sclang.log`, `norns-matron.log` |
 | `auto-start?` | `#f` | start at login |
@@ -91,10 +93,19 @@ Guix and x86:
   - `NORNS_SDL_DEBUG=1` logs the window's events
 - the SELECT menu's hardcoded `/home/we/dust/code/`
 
+### maiden
+
+maiden v1.1.6, as on the norns hardware. The Go server is built from
+source; the web app (React, whose build needs Node 16 and an npm tree Guix
+doesn't have) comes prebuilt from norns' official v2.9.4 release, which
+ships the same maiden.
+
+Shepherd listens on maiden's port and starts maiden on the first
+connection (socket activation, as on a norns). Its buttons for restarting
+matron/SuperCollider need systemd and don't work here; use SYSTEM > RESTART
+or `herd restart norns`.
+
 ## Not here yet
 
-- maiden (the web editor): its Go server needs packaging, and its frontend
-  needs Node 16 with an offline yarn cache. Meanwhile `maiden-repl` (in the
-  norns package) is a terminal REPL for matron and sclang.
 - The OSC ports (matron 10111 and 8888, crone 9999, sclang 57120) listen on
   every interface, as on a norns; liblo binds them inside matron and crone.
